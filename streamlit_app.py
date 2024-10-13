@@ -1,151 +1,125 @@
 import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
+import websocket
+import json
+import base64
+import pyaudio
+import threading
+import os
+from pydub import AudioSegment
+from pydub.playback import play
+import io
+import tempfile
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# Initialize PyAudio
+CHUNK = 4096
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 24000
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+p = pyaudio.PyAudio()
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# Streamlit app state
+if 'ws' not in st.session_state:
+    st.session_state.ws = None
+if 'conversation' not in st.session_state:
+    st.session_state.conversation = []
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+def on_message(ws, message):
+    event = json.loads(message)
+    if event['type'] == 'response.output_item.added':
+        if event['item']['type'] == 'message':
+            for content in event['item']['content']:
+                if content['type'] == 'text':
+                    st.session_state.conversation.append(('assistant', content['text']))
+                elif content['type'] == 'audio':
+                    audio_data = base64.b64decode(content['audio'])
+                    play_audio(audio_data)
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+def on_error(ws, error):
+    st.error(f"WebSocket error: {error}")
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+def on_close(ws, close_status_code, close_msg):
+    st.warning("WebSocket connection closed")
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+def on_open(ws):
+    st.success("Connected to OpenAI Realtime API")
+    ws.send(json.dumps({
+        "type": "response.create",
+        "response": {
+            "modalities": ["text", "audio"],
+            "instructions": "You are a helpful AI assistant. Respond concisely.",
+        }
+    }))
+
+def connect_websocket():
+    websocket.enableTrace(True)
+    ws = websocket.WebSocketApp(
+        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
+        header={
+            "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
+            "OpenAI-Beta": "realtime=v1",
+        },
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        on_open=on_open
     )
+    wst = threading.Thread(target=ws.run_forever)
+    wst.daemon = True
+    wst.start()
+    return ws
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+def play_audio(audio_data):
+    audio = AudioSegment.from_raw(io.BytesIO(audio_data), sample_width=2, frame_rate=24000, channels=1)
+    play(audio)
 
-    return gdp_df
+def record_audio():
+    stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+    st.write("Recording... Press 'Stop Recording' when finished.")
+    frames = []
+    
+    stop_recording = st.button("Stop Recording")
+    
+    while not stop_recording:
+        data = stream.read(CHUNK)
+        frames.append(data)
+        stop_recording = st.button("Stop Recording")
+    
+    st.write("Recording stopped.")
+    stream.stop_stream()
+    stream.close()
+    
+    audio_data = b''.join(frames)
+    return audio_data
 
-gdp_df = get_gdp_data()
+def send_audio(audio_data):
+    base64_audio = base64.b64encode(audio_data).decode('utf-8')
+    st.session_state.ws.send(json.dumps({
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "audio": base64_audio
+            }]
+        }
+    }))
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+def main():
+    st.title("OpenAI Realtime Voice Interaction")
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+    if st.session_state.ws is None:
+        if st.button("Connect to OpenAI"):
+            st.session_state.ws = connect_websocket()
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+    if st.session_state.ws:
+        if st.button("Start Recording"):
+            audio_data = record_audio()
+            send_audio(audio_data)
 
-# Add some spacing
-''
-''
+        for role, message in st.session_state.conversation:
+            st.write(f"{role.capitalize()}: {message}")
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+if __name__ == "__main__":
+    main()
