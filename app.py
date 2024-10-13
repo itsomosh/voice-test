@@ -2,21 +2,17 @@ import streamlit as st
 import websocket
 import json
 import base64
-import pyaudio
 import threading
 import os
-from pydub import AudioSegment
-from pydub.playback import play
+import sounddevice as sd
+import numpy as np
+from scipy.io import wavfile
 import io
 import tempfile
 
-# Initialize PyAudio
-CHUNK = 4096
-FORMAT = pyaudio.paInt16
+# Audio settings
+SAMPLE_RATE = 24000
 CHANNELS = 1
-RATE = 24000
-
-p = pyaudio.PyAudio()
 
 # Streamlit app state
 if 'ws' not in st.session_state:
@@ -70,30 +66,30 @@ def connect_websocket():
     return ws
 
 def play_audio(audio_data):
-    audio = AudioSegment.from_raw(io.BytesIO(audio_data), sample_width=2, frame_rate=24000, channels=1)
-    play(audio)
+    # For simplicity, we'll just save the audio to a file and use st.audio to play it
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_audio:
+        temp_audio.write(audio_data)
+        temp_audio.flush()
+        st.audio(temp_audio.name, format='audio/wav')
 
-def record_audio():
-    stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
-    st.write("Recording... Press 'Stop Recording' when finished.")
-    frames = []
-    
-    stop_recording = st.button("Stop Recording")
-    
-    while not stop_recording:
-        data = stream.read(CHUNK)
-        frames.append(data)
-        stop_recording = st.button("Stop Recording")
-    
-    st.write("Recording stopped.")
-    stream.stop_stream()
-    stream.close()
-    
-    audio_data = b''.join(frames)
+def record_audio(duration=5):
+    st.write(f"Recording for {duration} seconds...")
+    audio_data = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=CHANNELS)
+    sd.wait()
+    st.write("Recording finished.")
     return audio_data
 
 def send_audio(audio_data):
-    base64_audio = base64.b64encode(audio_data).decode('utf-8')
+    # Convert float32 array to int16
+    audio_data_int16 = (audio_data * 32767).astype(np.int16)
+    
+    # Save as WAV file in memory
+    with io.BytesIO() as wav_buffer:
+        wavfile.write(wav_buffer, SAMPLE_RATE, audio_data_int16)
+        wav_buffer.seek(0)
+        wav_data = wav_buffer.read()
+    
+    base64_audio = base64.b64encode(wav_data).decode('utf-8')
     st.session_state.ws.send(json.dumps({
         "type": "conversation.item.create",
         "item": {
@@ -114,7 +110,7 @@ def main():
             st.session_state.ws = connect_websocket()
 
     if st.session_state.ws:
-        if st.button("Start Recording"):
+        if st.button("Record Audio (5 seconds)"):
             audio_data = record_audio()
             send_audio(audio_data)
 
